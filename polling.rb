@@ -8,11 +8,12 @@ require 'redis'
 class PingPolling < Sensu::Plugin::Check::CLI
 
 option :handler, :short => '-l HANDLER', :long => '--handler HANDLER', :default => 'default'
-option :options, :short => '-a OPTIONS', :long => "--fping-args OPTIONS", :default => '-t100 -i 11'
-option :verbose, :short => '-v', :long => "--verbose", :boolean => true, :default => false
-option :seed_file, :short => '-f SEED_FILE', :long => "--seed-file SEED_FILE", :default => 'devices.seed'
+option :options, :short => '-a OPTIONS', :long => '--fping-args OPTIONS', :default => '-t100 -i 11'
+option :verbose, :short => '-v', :long => '--verbose', :boolean => true, :default => false
+option :seed_file, :short => '-f SEED_FILE', :long => '--seed-file SEED_FILE', :default => 'devices.seed'
 option :split, :short => '-s SPLIT', :long => '--split SPLIT', :default => ','
-option :count, :short => '-c COUNT', :long => "--count COUNT", :default => '0'
+option :count, :short => '-c COUNT', :long => '--count COUNT', :default => '0'
+option :redis_key, :short => '-k KEY', :long => '--redis-key REDIS_KEY', :default => 'ping-polling:result'
 #consecutive
 
  def sensu_client_socket(msg)
@@ -51,9 +52,9 @@ option :count, :short => '-c COUNT', :long => "--count COUNT", :default => '0'
         seed_file.each { |line|
                 next if(line[0..0] == '#' || line.empty?)
                 array =  line.split(config[:split])
-                seedips = array[0]
+                ip_seed = array[0]
                 #hostname = array[1]
-                ips = "#{seedips} #{ips}"
+                ips = "#{ip_seed} #{ips}"
                 }
         return [ips,file_name]
  end
@@ -66,81 +67,77 @@ option :count, :short => '-c COUNT', :long => "--count COUNT", :default => '0'
 		return cmd_out
   end
 
-  def grep_seed(ip)
-        ip_grep = nil
-        hostname = nil
+  def check_hostname(ip_current)
+        hostname = Array.new
+		ip_seed = Array.new
         seed = IO.readlines(config[:seed_file])
         #seed.each { |x| x.strip! }
         seed.each { |line|
         array =  line.split(config[:split])
-        seedips = array[0]
-                if seedips == ip
-                # puts "match #{seedips} #{ip}"
-                ip_grep = seedips
+        ip_seed = array[0]
+                if ip_seed == ip_current
+                # puts "match #{seedip} #{ip_current}"
                 hostname = array[1]
                 end
         }
-        #puts "grep_seed : #{ip_grep} , #{hostname}"
-        return [ip_grep, hostname]
+        #puts "check_hostname : #{ip_current} , #{hostname}"
+        return [ip_seed,hostname]
   end
 
 
-  def check_cons(ip, status)
-        ip_cons = nil
-        cons = 1
-        redis = Redis.new
-        seed = JSON.parse(redis.get("fping2"))
+  def check_occurrences(ip_current, status)
+        ip_history = nil
+        seed = JSON.parse($redis.get($redis_key))
         seed.each { |line|
         array =  line.split(',')
-        ip_cons = array[0]
-                if ip_cons == ip
-                # MATCH IP IN DB THEN CHECK VALUE
+        ip_history = array[0]
+                if ip_history == ip_current
+                # MATCH IP IN DB THEN CHECK OCCURRENCES
 					if status == array[3]
-					cons = array[4].to_i + 1
-					else
-					cons = 1
+					@occurrences = array[4].to_i + 1
 					end
                 end
         }
-        #puts "redis get: #{ip},#{cons}"
-        return [ip_cons ,cons]
+        #puts "redis get: #{ip_history},#{@occurrences}"
+        return [ip_history,@occurrences]
   end
 
   def run
-        cmd_out = run_fping
+        value = Array.new
+		# RUN CMD
+		cmd_out = run_fping
         #ips, file_name = read_seed
 		#cmd = "fping #{config[:options]} #{ips} 2>/dev/null"
 		#cmd_out = %x[#{cmd}]
-		result = cmd_out.each_line("\n").to_a
-		value=[]
-		cons=1
-        # LOOPING RESULT
-		result.each { |line|
+		fping_result = cmd_out.each_line("\n").to_a
+		fping_result.each { |line|
+		# LOOPING RESULT
+		@occurrences = 1
         array = line.split(' ')
-        ip = array[0]
+        ip_current = array[0]
         status = array[2]
 		# LOOKUP FOR HOSTNAME
-        ip_grep, hostname = grep_seed(ip)
+        ip_seed, hostname = check_hostname(ip_current)
 		# OPEN REDIS
-		redis = Redis.new
-			if redis.exists "fping2"
+		$redis = Redis.new
+		$redis_key = config[:redis_key]
+			if $redis.exists $redis_key
 			# LOOKING FOR EXISTING MSG
-			ip_cons, cons = check_cons(ip, status)
+			ip_history, @occurrences = check_occurrences(ip_current, status)
 			end
-        data = "#{ip},#{ip_grep},#{hostname},#{status},#{cons}"
+        data = "#{ip_current},#{ip_seed},#{hostname.strip},#{status},#{@occurrences}"
         value << data
 			if status == 'unreachable'
-				if cons >= config[:count].to_i
-                #puts "#{hostname} is #{status} with consecutive #{cons} "
-				#send_critical hostname, "Host '#{hostname}':'#{ip} is unreachable"
+				if @occurrences >= config[:count].to_i
+                #puts "#{hostname} is #{status} with consecutive #{@occurrences} "
+				#send_critical hostname, "Host '#{hostname}':'#{ip_current} is unreachable"
 				end
 			else
-			#puts "#{hostname} is #{status} with consecutive #{cons} "
-			#send_ok hostname, "Host '#{hostname}':'#{ip} is alive"
+				#puts "#{hostname} is #{status} with consecutive #{@occurrences} "
+				#send_ok hostname, "Host '#{hostname}':'#{ip_current} is alive"
 			end
         }
-		redis = Redis.new
-		redis.set "fping2",value.to_json
+		$redis.set($redis_key,value.to_json)
 		ok "Finish"
 	end
 
